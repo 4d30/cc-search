@@ -35,7 +35,8 @@ class NewCCFetcher:
                                                        504],
                                      raise_on_status=False,
                                      )
-        self.http = urllib3.PoolManager(retries=retries)
+        self.http = urllib3.PoolManager(retries=retries,
+                                        maxsize=10)
         self.headers = {'User-Agent':'CareerAggregator/1.0 kaleh.net/cagg'}
         self.decoder = codecs.getreader('utf-8')
         if os.path.exists(cache_path):
