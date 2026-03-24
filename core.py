@@ -12,9 +12,11 @@ from operator import methodcaller, itemgetter
 from dataclasses import dataclass
 from configparser import ConfigParser
 import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 from multiprocessing import shared_memory
 import threading
 from time import sleep
+from concurrent.futures import ThreadPoolExecutor
 
 import urllib3
 from warcio.archiveiterator import ArchiveIterator
@@ -73,6 +75,15 @@ class NewCCFetcher:
                 response.release_conn()
 
 def wat_stream():
+    fetcher = NewCCFetcher()
+    paths = fetcher.get_wat_paths()
+    with ThreadPool(processes=8) as pool:
+        records = pool.imap_unordered(fetcher.get_wat_file, paths)
+        records = chain.from_iterable(records)
+        yield from records
+
+
+def wat_stream_old():
     fetcher = NewCCFetcher()
     paths = fetcher.get_wat_paths()
     records = map(fetcher.get_wat_file, paths)
@@ -221,7 +232,7 @@ def reaper_thread(manager_obj, done_queue):
         offset, length = msg
         # Now it has the 'manager_obj' to call the release logic
         manager_obj.release_offset(offset, length)
-
+        # print("Deallocated: ", offset, length)
 
 
 #   rules = ConfigParser()
@@ -258,6 +269,7 @@ def main():
             total_length = 2 + url_len + content_len
             while True:
                 offset = mgr.allocate_offset(total_length) # offset
+                #print("Allocated: ", offset, total_length)
                 if offset is not None:
                     break
                 sleep(5)
