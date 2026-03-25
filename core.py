@@ -247,9 +247,10 @@ def worker_process(shm_name, work_queue, done_queue):
             break # Shutdown signal
         offset, total_length = msg
         url_len = struct.unpack('H', shm.buf[offset : offset + 2])[0]
-        raw_view = shm.buf[offset + 2 + url_len : offset + total_length]
+        start = offset + 2 + url_len
+        end = offset + total_length
         for rule in rules:
-            if rule['link_match'] in raw_view:
+            if shm.buf.obj.find(rule['link_match'], start, end) != -1:
                 url = bytes(shm.buf[offset + 2 : offset + 2 + url_len])
                 url = url.decode('utf-8')
                 with open(rule['destination'], 'a') as handle:
@@ -262,11 +263,8 @@ def worker_process(shm_name, work_queue, done_queue):
     shm.close()
 
 def reaper_thread(manager_obj, done_queue):
-    reap_bytes = 0
-    reap_chunks = 0
-    reap_time = 0
     while True:
-        done_batch = done_queue.get() # Wait for the first one
+        done_batch = done_queue.get()
         if done_batch is None: break
         all_chunks = []
         all_chunks.extend(done_batch)
@@ -278,26 +276,10 @@ def reaper_thread(manager_obj, done_queue):
                 all_chunks.extend(batch)
             except queues.Empty:
                 break
-
-        t0 = time.perf_counter()
         with manager_obj.lock:
             for offset, length in all_chunks:
                 manager_obj.release_chunk(offset, length)
             manager_obj.coalesce()
-        t1 = time.perf_counter()
-        reap_time += (t1 - t0)
-        reap_chunks += len(all_chunks)
-        reap_bytes += sum(length for _, length in all_chunks)
-        msg = (f"{round(manager_obj.get_percent_free(), 3)} "
-               f"{round(manager_obj.get_percent_fragmented(), 3)} "
-               "\r")
-        sys.stdout.write(msg)
-        #print("REAPER:",
-              ##manager_obj._freelist
-              #"reap_bytes: " , reap_bytes,
-              #"chunks/sec:", reap_chunks / reap_time,
-              #"MB/sec:", reap_bytes / reap_time / (1024*1024),
-              #)
 
 def process_file(wat_file):
     wat_records = ArchiveIterator(io.BytesIO(wat_file))
@@ -344,48 +326,23 @@ def main():
     t.start()
     workers = []
     num_workers = 8
-    alloc_bytes = 0
-    alloc_count = 0
-    elapsed = 0
     for _ in range(num_workers):
         ww = mp.Process(target=worker_process,
                         args=(mgr.shm.name, work_queue, done_queue,))
         ww.start()
         workers.append(ww)
     try:
-        t0 = None
         for processed_record in wat_stream():
             url_len, url_len_struct, url_bytes, total_length, content = processed_record
             while True:
-                offset = mgr.allocate_offset(total_length) # offset
-                #print("Allocated: ", offset, total_length)
+                offset = mgr.allocate_offset(total_length)
                 if offset is not None:
                     break
                 sleep(0.01)
-                print(f"{mgr.get_percent_free()*pow(2,30)} free, cannot allocate {total_length}")
-                breakpoint()
             mgr.shm.buf[offset : offset + 2] = url_len_struct
             mgr.shm.buf[offset + 2 : offset + 2 + url_len] = url_bytes
             mgr.shm.buf[(offset + 2 + url_len):(offset + total_length)] = content
             work_queue.put((offset, total_length,))
-            alloc_bytes += total_length
-            alloc_count += 1
-            tt = time.perf_counter()
-            if t0 is not None:
-                #print(round(tt - t0, 6),
-                #      mgr.get_percent_free(),
-                #      mgr.get_percent_fragmented())
-                elapsed += (tt - t0)
-                t0 = tt
-                #if random.random() > 0.99:
-                    #print("ALLOC:",
-                          ##mgr._freelist
-                          #"alloc_bytes:", alloc_bytes,
-                          #"chunks/sec:", alloc_count / elapsed,
-                          #"MB/sec:", alloc_bytes / elapsed / (1024*1024),
-                          #)
-            else:
-                t0 = tt
             msg = (f"{round(mgr.get_percent_free(), 3)} "
                    f"{round(mgr.get_percent_fragmented(), 3)} "
                    "\r")
@@ -400,12 +357,6 @@ def main():
         done_queue.put(None)
         t.join()
         mgr.cleanup()
-#     pat = r'https://www\.teamtailor\.com/\?utm_campaign=poweredby'    
-#     path = 'teamtailor.dat'
-#     with open(path, 'w') as handle:
-#         for uri in search_wat(pat, wat_match=path):
-#             print(uri, file=handle)
-#             handle.flush()
 
 
 if __name__ == '__main__':
