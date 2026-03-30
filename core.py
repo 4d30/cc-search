@@ -10,13 +10,10 @@ import codecs
 import struct
 import time
 import ctypes
-import heapq
-import bisect
 import random
 from functools import partial
 from itertools import chain, repeat
 from operator import methodcaller, itemgetter
-from dataclasses import dataclass
 from configparser import ConfigParser
 import multiprocessing as mp
 from multiprocessing.pool import ThreadPool, Pool
@@ -25,9 +22,11 @@ from multiprocessing import queues
 import threading
 from time import sleep
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 import urllib3
-from warcio.archiveiterator import ArchiveIterator
+#from warcio.archiveiterator import ArchiveIterator
+from fastwarc.warc import ArchiveIterator, WarcRecordType
 
 
 class NewCCFetcher:
@@ -82,13 +81,6 @@ class NewCCFetcher:
             response.release_conn()
 
 
-def wat_stream_old():
-    fetcher = NewCCFetcher()
-    paths = fetcher.get_wat_paths()
-    records = map(fetcher.get_wat_file, paths)
-    records = chain.from_iterable(records)
-    yield from records
-
 
 def search_idx(query_str):
     cc = NewCCFetcher()
@@ -130,8 +122,8 @@ def search_wat(link_match, wat_match=None):
 
 class RawBufferManager:
     def __init__(self):
-        GiB = pow(2, 30)
-        shm_len = 6 * GiB
+        MiB = pow(2, 20)
+        shm_len = 128 * MiB
         self.shm = shared_memory.SharedMemory(name="cc_shm",
                                               create=True,
                                               size=shm_len)
@@ -212,18 +204,44 @@ def init_fetcher():
     http = urllib3.PoolManager(retries=retries, maxsize=4)
     headers = {'User-Agent': 'CareerAggregator/1.0 kaleh.net/cagg'}
 
+def process_record(wat_record):
+    url = wat_record.headers.get('WARC-Target-URI')
+    url_bytes = url.encode('utf-8')
+    url_len = len(url_bytes)
+    url_len_struct = struct.pack('H', url_len)
+    content_len = wat_record.content_length
+    # 'H' -- unsigned short is 2-bytes
+    total_length = 2 + url_len + content_len
+    content = wat_record.reader.read()
+    bytes = (url_len_struct, url_bytes, content,)
+    bytes = b''.join(bytes)
+    return bytes, total_length
 
-def fetcher_process(path):
-    # Each process creates its own PoolManager with the same retry logic
+def write_to_shm(mgr, record):
+    bytes, total_length = record
+    while True:
+        offset = mgr.allocate_offset(total_length)
+        if offset is not None:
+            break
+        sleep(0.01)
+    mgr.shm.buf[offset : offset + total_length] = bytes
+    return offset, total_length
+
+def fetcher_process(mgr, work_queue, path):
     url = f"https://data.commoncrawl.org/{path}"
+    print(url)
     with http.request('GET', url,
-                     headers=headers,
+                      headers=headers,
                       preload_content=False) as response:
-        # Stream and decompress on the fly
-        records = ArchiveIterator(response)
-        records = filter(lambda x: x.rec_type == 'metadata', records)
-        records = map(process_record, records)
-        yield from records
+        try:
+            records = ArchiveIterator(response, parse_http=False)
+            records = filter(lambda x: x.record_type == WarcRecordType.metadata, records)
+            records = map(process_record, records)
+            records = map(write_to_shm, repeat(mgr), records)
+            proc = map(work_queue.put, records)
+            deque(proc, maxlen=0)
+        finally:
+            response.release_conn()
 
 
 def worker_process(shm_name, work_queue, done_queue):
@@ -242,7 +260,6 @@ def worker_process(shm_name, work_queue, done_queue):
     while True:
         msg = work_queue.get()
         if msg is None:
-            
             done_queue.put(done_batch)
             break # Shutdown signal
         offset, total_length = msg
@@ -281,40 +298,12 @@ def reaper_thread(manager_obj, done_queue):
                 manager_obj.release_chunk(offset, length)
             manager_obj.coalesce()
 
-def process_file(wat_file):
-    wat_records = ArchiveIterator(io.BytesIO(wat_file))
-    wat_records = filter(lambda x: x.rec_type == 'metadata', wat_records)
-    records = map(process_record, wat_records)
-    return tuple(records)
-
-def process_record(wat_record):
-    url = wat_record.rec_headers.get_header('WARC-Target-URI')
-    url_bytes = url.encode('utf-8')
-    url_len = len(url_bytes)
-    url_len_struct = struct.pack('H', url_len)
-    content_len = wat_record.length
-    # 'H' -- unsigned short is 2-bytes
-    total_length = 2 + url_len + content_len
-    content = wat_record.content_stream().read()
-    return (url_len, url_len_struct, url_bytes, total_length,
-            content,)
-
-def wat_stream_old():
+def wat_stream(mgr, work_queue):
     fetcher = NewCCFetcher()
     paths = fetcher.get_wat_paths()
-    with ThreadPool(processes=8) as thread_pool:
-        wat_files = thread_pool.imap_unordered(fetcher.get_wat_file, paths)
-        with mp.Pool(processes=8) as proc_pool:
-            records = proc_pool.imap_unordered(process_file, wat_files)
-            yield from filter(bool, records)
-
-def wat_stream():
-    fetcher = NewCCFetcher()
-    paths = fetcher.get_wat_paths()
+    proc = partial(fetcher_process, mgr, work_queue)
     with ThreadPool(processes=2, initializer=init_fetcher) as pool:
-        record_iterators = pool.imap_unordered(fetcher_process, paths)
-        records = chain.from_iterable(record_iterators)
-        yield from records
+        pool.map(proc, paths)
 
 def main():
     mgr = RawBufferManager()
@@ -325,28 +314,30 @@ def main():
                          daemon=True)
     t.start()
     workers = []
-    num_workers = 8
+    num_workers = 2
     for _ in range(num_workers):
         ww = mp.Process(target=worker_process,
                         args=(mgr.shm.name, work_queue, done_queue,))
         ww.start()
         workers.append(ww)
     try:
-        for processed_record in wat_stream():
-            url_len, url_len_struct, url_bytes, total_length, content = processed_record
-            while True:
-                offset = mgr.allocate_offset(total_length)
-                if offset is not None:
-                    break
-                sleep(0.01)
-            mgr.shm.buf[offset : offset + 2] = url_len_struct
-            mgr.shm.buf[offset + 2 : offset + 2 + url_len] = url_bytes
-            mgr.shm.buf[(offset + 2 + url_len):(offset + total_length)] = content
-            work_queue.put((offset, total_length,))
-            msg = (f"{round(mgr.get_percent_free(), 3)} "
-                   f"{round(mgr.get_percent_fragmented(), 3)} "
-                   "\r")
-            sys.stdout.write(msg)
+        wat_stream(mgr, work_queue)
+            #url_len, url_len_struct, url_bytes, total_length, content = processed_record
+            ##print(url_len)
+            #while True:
+                #offset = mgr.allocate_offset(total_length)
+                #if offset is not None:
+                    #break
+                ##print('344')
+                #sleep(0.01)
+            #mgr.shm.buf[offset : offset + 2] = url_len_struct
+            #mgr.shm.buf[offset + 2 : offset + 2 + url_len] = url_bytes
+            #mgr.shm.buf[(offset + 2 + url_len):(offset + total_length)] = content
+            #work_queue.put((offset, total_length,))
+            #msg = (f"{round(mgr.get_percent_free(), 3)} "
+                   #f"{round(mgr.get_percent_fragmented(), 3)} "
+                   #"\r")
+            #sys.stdout.write(msg)
 
     finally:
         for _ in range(num_workers):
@@ -360,4 +351,8 @@ def main():
 
 
 if __name__ == '__main__':
+    #fetcher = NewCCFetcher()
+    #paths = fetcher.get_wat_paths()
+    #for pp in paths:
+        #print(pp)
     main()
